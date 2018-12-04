@@ -9,7 +9,10 @@
 #include "passes/insert_explicit_expand.h"
 #include "passes/remove_unused_forward_outputs.h"
 #include "passes/replace_untraced_operators.h"
+#include "passes/set_elementwise_output_shape.h"
+#include "passes/set_log_softmax_output_shape.h"
 #include "passes/set_mat_mul_output_shape.h"
+#include "passes/set_threshold_output_shape.h"
 #include "passes/threshold_backward_peephole.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/xla_util.h"
@@ -18,6 +21,7 @@
 #include "torch/csrc/jit/passes/constant_propagation.h"
 #include "torch/csrc/jit/passes/dead_code_elimination.h"
 #include "torch/csrc/jit/passes/lower_tuples.h"
+#include "torch/csrc/jit/passes/shape_analysis.h"
 #include "torch/csrc/jit/passes/specialize_undef.h"
 
 namespace torch {
@@ -62,6 +66,19 @@ XlaModule::TensorBatchVector DecomposeComputationResult(
   return batch_tensors;
 }
 
+bool IsXlaFloatType(const xla::PrimitiveType type) {
+  switch (type) {
+    case xla::PrimitiveType::F16:
+    case xla::PrimitiveType::F32:
+    case xla::PrimitiveType::BF16:
+    case xla::PrimitiveType::F64:
+      return true;
+    default:
+      return false;
+  }
+  return false;
+}
+
 }  // namespace
 
 XlaModule::XlaModule(const std::shared_ptr<script::Module> module,
@@ -83,10 +100,13 @@ void XlaModule::Initialize(const TensorBatchVector& inputs) {
   CanonicalizeOps(forward_graph);
   SetMatMulOutputShape(forward_graph);
   InsertExplicitExpand(forward_graph);
-  EvalStaticSize(forward_graph);
   ConstantPropagation(forward_graph);
   ReplaceUntracedOperators(forward_graph);
   EliminateDeadCode(forward_graph);
+  // TODO(asuhan): run inference to fixed point
+  SetElementwiseOutputShape(forward_graph);
+  SetThresholdOutputShape(forward_graph);
+  SetLogSoftmaxOutputShape(forward_graph);
 
   // Convert model parameters to vector of XLATensors.
   std::vector<at::Tensor*> params_buffers_regather;
@@ -142,13 +162,11 @@ void XlaModule::Initialize(const TensorBatchVector& inputs) {
   // Run the forward passes.
   CanonicalizeOps(gradient.f);
   InsertExplicitExpand(gradient.f);
-  EvalStaticSize(gradient.f);
   ConstantPropagation(gradient.f);
   ReplaceUntracedOperators(gradient.f);
   EliminateDeadCode(gradient.f);
   // Run the backward passes.
   specializeUndef(*(gradient.df.get()));
-  EvalStaticSize(gradient.df);
   ConstantPropagation(gradient.df);
   ThresholdBackwardPeephole(gradient.df);
   EliminateDeadCode(gradient.df);
@@ -231,6 +249,9 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
     for (auto p : captured_outputs_[i]) {
       // TODO(asuhan): Remove the all zero grad outputs from the forward trace
       // output.
+      if (!IsXlaFloatType(p->shape().element_type())) {
+        continue;
+      }
       replica_raw_grad_outputs.push_back(p);
       if (i == 0) {
         zero_input.push_back(true);
